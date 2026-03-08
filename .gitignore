@@ -1,0 +1,3 @@
+# 忽略所有.env文件
+.env
+node_modules
