@@ -13,51 +13,31 @@ import { z } from 'zod';
 import { Runnable } from '@langchain/core/runnables';
 
 
-const database = {
-  users: {
-    '001': { id: '001', name: '张三', email: 'zhangsan@example.com', role: 'admin' },
-    '002': { id: '002', name: '李四', email: 'lisi@example.com', role: 'user' },
-    '003': { id: '003', name: '王五', email: 'wangwu@example.com', role: 'user' },
-  },
-};
-
+// 与 AiModule 里 QUERY_USER_TOOL 的 schema（userId）保持一致
 const queryUserArgsSchema = z.object({
-  id: z.string().describe('用户ID'),
+  userId: z.string().describe('用户 ID'),
 });
 
-type QueryUserArgs = z.infer<typeof queryUserArgsSchema>;
 
-
-const queryUserTool = tool(
-  (args: QueryUserArgs): string => {
-    const { id } = args;
-    const user = database.users[id];
-    if (!user) {
-      return `用户ID ${id} 不存在`;
-    }
-    return `用户信息：\n- ID: ${user.id}\n- 姓名: ${user.name}\n- 邮箱: ${user.email}\n- 角色: ${user.role}`;
-
-  },
-  {
-    name: 'query_user',
-    description: '查询用户信息',
-    schema: queryUserArgsSchema,
-  }
-);
 
 @Injectable()
 export class AiService {
 
   private readonly modelWithTools: Runnable<BaseMessage[], AIMessage>;
 
-  constructor(@Inject('CHAT_MODEL') model: ChatOpenAI) {
-    this.modelWithTools = model.bindTools([queryUserTool]);
+  constructor(
+    @Inject('CHAT_MODEL') model: ChatOpenAI,
+    @Inject('QUERY_USER_TOOL') private readonly queryUserTool: any,
+    @Inject('SEND_MAIL_TOOL') private readonly sendEmailTool: any,
+    @Inject('WEB_SEARCH_TOOL') private readonly webSearchTool: any,
+  ) {
+    this.modelWithTools = model.bindTools([this.queryUserTool, this.sendEmailTool, this.webSearchTool]);
   }
 
   async *runChain(input: string) {
     const messages: BaseMessage[] = [
       new SystemMessage(`你是一个AI助手，请根据用户的问题给出回答。
-      `), 
+      `),
       new HumanMessage(input),
     ];
     const maxRounds = 16;
@@ -66,7 +46,7 @@ export class AiService {
 
       let fullMessages: AIMessageChunk | null = null;
       for await (const chunk of stream) {
-        console.log(chunk);
+        // console.log(chunk);
 
         if (!AIMessageChunk.isInstance(chunk)) continue;
         fullMessages = fullMessages ? fullMessages.concat(chunk) : chunk;
@@ -89,15 +69,34 @@ export class AiService {
       for (const tc of toolCalls) {
         const { id, name } = tc;
 
-        if (name === queryUserTool.name) {
+        if (name === this.queryUserTool.name) {
           const args = queryUserArgsSchema.parse(tc.args);
-          const toolResult = await queryUserTool.invoke(args);
+          const toolResult = await this.queryUserTool.invoke(args);
           messages.push(
             new ToolMessage({
               content:
                 typeof toolResult === 'string' ? toolResult : String(toolResult),
               name,
               tool_call_id: id ?? '',
+            }),
+          );
+        } else if (name === this.sendEmailTool.name) {
+
+          const toolResult = await this.sendEmailTool.invoke(tc.args);
+          messages.push(
+            new ToolMessage({
+              content: toolResult,
+              tool_call_id: id ?? '',
+              name,
+            }),
+          );
+        } else if (name === this.webSearchTool.name) {
+          const toolResult = await this.webSearchTool.invoke(tc.args);
+          messages.push(
+            new ToolMessage({
+              content: toolResult,
+              tool_call_id: id ?? '',
+              name,
             }),
           );
         } else {
