@@ -167,7 +167,7 @@
         sendBtn.disabled = true;
         statusEl.textContent = '状态：连接中…';
 
-        const url = `http:localhost:3000/ai/chat?query=${encodeURIComponent(query)}`;
+        const url = `http://localhost:3000/ai/chat?query=${encodeURIComponent(query)}`;
         es = new EventSource(url);
 
         es.onopen = () => {
