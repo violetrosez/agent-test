@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ASR 录音测试</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      max-width: 720px;
+      margin: 40px auto;
+      padding: 0 16px;
+      line-height: 1.6;
+    }
+
+    button {
+      margin-right: 8px;
+      margin-bottom: 8px;
+      padding: 8px 14px;
+    }
+
+    .status {
+      margin: 12px 0;
+      color: #444;
+    }
+
+    pre {
+      background: #f6f8fa;
+      padding: 12px;
+      border-radius: 6px;
+      white-space: pre-wrap;
+    }
+
+    #modeHint {
+      font-size: 0.9em;
+      color: #555;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>ASR 录音上传测试</h1>
+  <p>点击开始录音，结束后自动上传到 <code>/speech/asr</code>。</p>
+  <p class="status" id="modeHint"></p>
+
+  <button type="button" id="startBtn">开始录音</button>
+  <button type="button" id="stopBtn" disabled>停止并上传</button>
+  <div class="status" id="status">状态：未开始</div>
+  <h3>识别结果</h3>
+  <pre id="result">（暂无）</pre>
+
+  <script>
+    const ASR_TARGET_RATE = 16000;
+
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    const modeHintEl = document.getElementById("modeHint");
+
+    /** @type {null | { kind: 'ogg'; stream: MediaStream; recorder: MediaRecorder; mimeType: string; chunks: Blob[] }} */
+    let sessionOgg = null;
+
+    /** @type {null | { stream: MediaStream; ctx: AudioContext; processor: ScriptProcessorNode; source: MediaStreamAudioSourceNode; mute: GainNode; buffers: Float32Array[]; inputRate: number }} */
+    let sessionWav = null;
+
+    function setStatus(text) {
+      statusEl.textContent = "状态：" + text;
+    }
+
+    function pickOggMimeType() {
+      const candidates = [
+        "audio/ogg;codecs=opus",
+        "audio/ogg",
+      ];
+      for (const m of candidates) {
+        if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) {
+          return m;
+        }
+      }
+      return "";
+    }
+
+    function updateModeHint(oggMime, usingWavFallback) {
+      if (oggMime) {
+        modeHintEl.textContent =
+          "当前使用浏览器 MediaRecorder，封装格式：" +
+          oggMime +
+          "（与腾讯云 VoiceFormat=ogg-opus 一致）。常见于 Firefox / 部分 Chromium。";
+      } else if (usingWavFallback) {
+        modeHintEl.textContent =
+          "当前浏览器不支持 OGG Opus 录音，已改用 Web Audio 采集 PCM 并封装为 " +
+          ASR_TARGET_RATE +
+          " Hz 单声道 WAV（与腾讯云 VoiceFormat=wav / 16k_zh 一致），无需 WebM、也无需服务端 ffmpeg。";
+      }
+    }
+
+    function filenameForMime(mime) {
+      const m = (mime || "").toLowerCase();
+      if (m.includes("ogg")) return "record.ogg";
+      if (m.includes("wav")) return "record.wav";
+      if (m.includes("webm")) return "record.webm";
+      return "record.bin";
+    }
+
+    function mergeFloat32(chunks) {
+      let n = 0;
+      for (const c of chunks) n += c.length;
+      const out = new Float32Array(n);
+      let off = 0;
+      for (const c of chunks) {
+        out.set(c, off);
+        off += c.length;
+      }
+      return out;
+    }
+
+    function resampleLinear(input, inputRate, outputRate) {
+      if (inputRate === outputRate) return input;
+      const outLen = Math.max(1, Math.floor((input.length * outputRate) / inputRate));
+      const out = new Float32Array(outLen);
+      const ratio = inputRate / outputRate;
+      for (let i = 0; i < outLen; i++) {
+        const srcPos = i * ratio;
+        const i0 = Math.floor(srcPos);
+        const i1 = Math.min(i0 + 1, input.length - 1);
+        const f = srcPos - i0;
+        out[i] = input[i0] * (1 - f) + input[i1] * f;
+      }
+      return out;
+    }
+
+    function encodeWavMono16Bit(samples, sampleRate) {
+      const bytesPerSample = 2;
+      const blockAlign = bytesPerSample;
+      const byteRate = sampleRate * blockAlign;
+      const dataSize = samples.length * bytesPerSample;
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+
+      function writeStr(offset, s) {
+        for (let i = 0; i < s.length; i++) {
+          view.setUint8(offset + i, s.charCodeAt(i));
+        }
+      }
+
+      writeStr(0, "RIFF");
+      view.setUint32(4, 36 + dataSize, true);
+      writeStr(8, "WAVE");
+      writeStr(12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, byteRate, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, 16, true);
+      writeStr(36, "data");
+      view.setUint32(40, dataSize, true);
+
+      let offset = 44;
+      for (let i = 0; i < samples.length; i++, offset += 2) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(
+          offset,
+          s < 0 ? Math.round(s * 0x8000) : Math.round(s * 0x7fff),
+          true,
+        );
+      }
+      return buffer;
+    }
+
+    async function uploadBlob(blob, filename) {
+      if (!blob.size) {
+        throw new Error("录音数据为空，请至少录制 1 秒再上传");
+      }
+      const formData = new FormData();
+      formData.append("audio", blob, filename);
+      const response = await fetch("/speech/asr", {
+        method: "POST",
+        body: formData,
+      });
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(text || "请求失败");
+      }
+      return response.json();
+    }
+
+    async function stopWavSessionAndUpload() {
+      const s = sessionWav;
+      sessionWav = null;
+      if (!s) return;
+
+      setStatus("处理录音并上传...");
+      try {
+        s.source.disconnect();
+        s.processor.disconnect();
+        s.mute.disconnect();
+        s.processor.onaudioprocess = null;
+        await s.ctx.close();
+
+        let pcm = mergeFloat32(s.buffers);
+        pcm = resampleLinear(pcm, s.inputRate, ASR_TARGET_RATE);
+        const wavBuf = encodeWavMono16Bit(pcm, ASR_TARGET_RATE);
+        const blob = new Blob([wavBuf], { type: "audio/wav" });
+        const data = await uploadBlob(blob, "record.wav");
+        resultEl.textContent = data.text ?? "（空结果）";
+        setStatus("上传完成");
+      } catch (error) {
+        setStatus("上传失败");
+        resultEl.textContent =
+          "错误：" + (error instanceof Error ? error.message : String(error));
+      } finally {
+        s.stream.getTracks().forEach((t) => t.stop());
+      }
+    }
+
+    function startWavCapture(stream) {
+      const buffers = [];
+      const ctx = new AudioContext();
+      const inputRate = ctx.sampleRate;
+      const source = ctx.createMediaStreamSource(stream);
+      const processor = ctx.createScriptProcessor(4096, 1, 1);
+      const mute = ctx.createGain();
+      mute.gain.value = 0;
+
+      processor.onaudioprocess = (ev) => {
+        const ch0 = ev.inputBuffer.getChannelData(0);
+        buffers.push(new Float32Array(ch0));
+      };
+
+      source.connect(processor);
+      processor.connect(mute);
+      mute.connect(ctx.destination);
+
+      sessionWav = {
+        stream,
+        ctx,
+        processor,
+        source,
+        mute,
+        buffers,
+        inputRate,
+      };
+    }
+
+    startBtn.addEventListener("click", async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const oggMime = pickOggMimeType();
+
+        if (oggMime) {
+          updateModeHint(oggMime, false);
+          const chunks = [];
+          const recorder = new MediaRecorder(stream, { mimeType: oggMime });
+          sessionOgg = { kind: "ogg", stream, recorder, mimeType: oggMime, chunks };
+
+          recorder.ondataavailable = (event) => {
+            if (event.data && event.data.size > 0) chunks.push(event.data);
+          };
+
+          recorder.onstop = async () => {
+            const sess = sessionOgg;
+            sessionOgg = null;
+            setStatus("录音结束，正在上传...");
+            try {
+              const blob = new Blob(sess.chunks, { type: sess.mimeType });
+              const data = await uploadBlob(blob, filenameForMime(sess.mimeType));
+              resultEl.textContent = data.text ?? "（空结果）";
+              setStatus("上传完成");
+            } catch (error) {
+              setStatus("上传失败");
+              resultEl.textContent =
+                "错误：" +
+                (error instanceof Error ? error.message : String(error));
+            } finally {
+              sess.stream.getTracks().forEach((t) => t.stop());
+              startBtn.disabled = false;
+            }
+          };
+
+          recorder.start(250);
+          setStatus("录音中（OGG）...");
+        } else {
+          updateModeHint("", true);
+          startWavCapture(stream);
+          setStatus("录音中（WAV/PCM）...");
+        }
+
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+      } catch (error) {
+        setStatus("无法开始录音");
+        resultEl.textContent =
+          "错误：" + (error instanceof Error ? error.message : String(error));
+      }
+    });
+
+    stopBtn.addEventListener("click", async () => {
+      stopBtn.disabled = true;
+      if (sessionOgg && sessionOgg.recorder.state !== "inactive") {
+        sessionOgg.recorder.stop();
+      } else if (sessionWav) {
+        await stopWavSessionAndUpload();
+        startBtn.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

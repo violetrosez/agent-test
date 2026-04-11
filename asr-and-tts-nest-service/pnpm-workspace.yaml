@@ -1,0 +1,4 @@
+allowBuilds:
+  '@nestjs/core': false
+  ffmpeg-static: false
+  unrs-resolver: false
