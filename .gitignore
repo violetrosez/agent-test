@@ -4,3 +4,4 @@ node_modules
 react-todo-app
 tool-test
 asr-and-tts-nest-service/dist/*
+*/dist/*

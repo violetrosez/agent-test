@@ -10,11 +10,17 @@ import { ChatOpenAI } from '@langchain/openai';
         {
             provide: 'CHAT_MODEL',
             useFactory: (configService: ConfigService) => {
+                const apiKey =
+                    configService.get<string>('MINIMAX_API_KEY') ??
+                    configService.get<string>('ALIYUN_API_KEY');
+                const baseURL =
+                    configService.get<string>('MINIMAX_BASE_URL') ??
+                    configService.get<string>('ALIYUN_BASE_URL');
                 return new ChatOpenAI({
                     model: configService.get('MODEL_NAME'),
-                    apiKey: configService.get('ALIYUN_API_KEY'),
+                    apiKey,
                     configuration: {
-                        baseURL: configService.get('ALIYUN_BASE_URL'),
+                        baseURL,
                     },
                 });
             },
